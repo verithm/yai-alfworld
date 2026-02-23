@@ -1,0 +1,41 @@
+# ALFWorld Text-Only Environment Configuration
+# Compatible with alfworld>=0.3.0 (uses get_environment() API)
+
+dataset:
+  data_path: '/data/alfworld/json_2.1.1/train'
+  eval_id_data_path: '/data/alfworld/json_2.1.1/valid_seen'
+  eval_ood_data_path: '/data/alfworld/json_2.1.1/valid_unseen'
+  num_train_games: -1       # -1 = all games
+  num_eval_games: -1
+
+env:
+  type: 'AlfredTWEnv'
+  goal_desc_human_anns_prob: 0.0
+  domain_randomization: false
+  expert_type: 'handcoded'
+  task_types:
+    - 1   # pick_and_place_simple
+    - 2   # look_at_obj_in_light
+    - 3   # pick_clean_then_place_in_recep
+    - 4   # pick_heat_then_place_in_recep
+    - 5   # pick_cool_then_place_in_recep
+    - 6   # pick_two_obj_and_place
+
+logic:
+  domain: '/data/alfworld/logic/alfred.pddl'
+  grammar: '/data/alfworld/logic/alfred.twl2'
+
+general:
+  training_method: 'dagger'
+  random_seed: 42
+
+# Required keys for AlfredTWEnv init (not used in text-only eval)
+rl:
+  training:
+    max_episode: 50000
+    max_nb_steps_per_episode: 50
+
+dagger:
+  training:
+    max_episode: 50000
+    max_nb_steps_per_episode: 50

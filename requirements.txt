@@ -1,0 +1,6 @@
+alfworld[full]
+requests
+pyyaml
+rich
+tqdm
+numpy

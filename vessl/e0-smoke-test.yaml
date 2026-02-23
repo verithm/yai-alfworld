@@ -1,0 +1,65 @@
+# VESSL Job Spec — E0: Smoke Test
+# Purpose : Verify GPU access, Ollama model serving, and all agent imports.
+#           2 games × 5 agents ≈ 10–15 minutes.
+# Run with: vessl run create -f vessl/e0-smoke-test.yaml
+#
+# Storage  : vessl-storage (org=YS-YAI)
+# Volumes  : alfworld-data, alfworld-scripts, alfworld-results
+
+name: alfworld-e0-smoke-test
+
+resources:
+  cluster: yonsei-ai-gpu
+  preset: gpu-1
+
+image: quay.io/vessl-ai/torch:2.3.1-cuda12.1-r5
+
+env:
+  OLLAMA_URL:       "http://localhost:11434"
+  ALFWORLD_DATA:    "/data/alfworld"
+  MODEL_NAME:       "llama3.1:8b"
+  PYTHONUNBUFFERED: "1"
+
+run:
+  - command: |
+      set -e
+
+      # --- Install dependencies (VESSL auto-authenticates via injected token) ---
+      pip install --quiet vessl alfworld textworld rich
+
+      # --- Download scripts from VESSL volume ---
+      python3 -c "import vessl.storage, os; os.makedirs('/tmp/scripts', exist_ok=True); vessl.storage.download_volume_file('vessl-storage', 'alfworld-scripts', '/tmp/scripts/')"
+
+      # --- Set up scripts ---
+      mkdir -p /app
+      cd /tmp/scripts
+      if ls *.zip 1>/dev/null 2>&1; then
+        unzip -o *.zip -d /app/
+      else
+        cp -r . /app/
+      fi
+
+      # --- Download ALFWorld data from VESSL volume ---
+      python3 -c "import vessl.storage, os; os.makedirs('/data/alfworld', exist_ok=True); vessl.storage.download_volume_file('vessl-storage', 'alfworld-data', '/data/alfworld/')"
+
+      # --- Install Ollama and pull model ---
+      curl -fsSL https://ollama.com/install.sh | sh
+      ollama serve &
+      sleep 10
+      ollama pull llama3.1:8b
+
+      # --- Run smoke test ---
+      cd /app
+      mkdir -p /app/results
+      python scripts/run_baseline.py \
+        --agents zero_shot few_shot react reflexion hierarchical \
+        --num-games 2 \
+        --max-steps 20 \
+        --split eval_out_of_distribution \
+        --output /app/results/e0_smoke_results.json
+
+      # --- Upload results to VESSL volume ---
+      python3 -c "import vessl.storage; vessl.storage.upload_volume_file('/app/results/', 'vessl-storage', 'alfworld-results')"
+
+      echo "=== E0 smoke test complete ==="
+      python3 -c "import json; d=json.load(open('/app/results/e0_smoke_results.json')); [print(f'  {k}: SR={v[\"success_rate\"]:.1%}  avg_steps={v.get(\"avg_steps\",0):.1f}') for k,v in d.get('agents',{}).items()]"

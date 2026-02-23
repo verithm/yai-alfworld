@@ -1,0 +1,48 @@
+# Data — downloaded via alfworld-download in workspace
+data/
+
+# Generated results and checkpoints
+results/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# Build artifacts
+*.zip
+*.egg-info/
+dist/
+build/
+
+# Docker (not used in workspace mode)
+Dockerfile
+docker-compose.yml
+entrypoint.sh
+
+# Environment
+.env
+*.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI tooling state (Claude Code / oh-my-claudecode)
+.claude/
+.omc/
+
+# Dev containers (not used in workspace mode)
+.devcontainer/
+
+# Editor
+.vscode/
+.idea/
+*.swp

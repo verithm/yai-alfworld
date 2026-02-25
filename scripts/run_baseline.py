@@ -2,8 +2,8 @@
 """
 ALFWorld Baseline Evaluation
 =============================
-Evaluates Zero-shot, Few-shot, and ReAct agents on ALFWorld text-only tasks
-using Llama-3.1-8B served via Ollama (CPU inference).
+Evaluates five agents on ALFWorld text-only tasks using Llama-3.1-8B via Ollama:
+  zero_shot, few_shot, react, reflexion, hierarchical_reflexion.
 
 Usage (inside Docker):
     python scripts/run_baseline.py [OPTIONS]
@@ -29,7 +29,7 @@ import argparse
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 
 import alfworld.agents.environment as environment
 from rich.console import Console
@@ -38,7 +38,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 # Make sure the scripts/ directory is importable
 sys.path.insert(0, str(Path(__file__).parent))
-from agents import ZeroShotAgent, FewShotAgent, CotAgent, ReActAgent, ReflexionAgent, HierarchicalAgent
+from agents import ZeroShotAgent, FewShotAgent, ReActAgent, ReflexionAgent, HierarchicalReflexionAgent
 
 console = Console()
 
@@ -99,10 +99,27 @@ def load_config(config_path: str, data_path: str) -> dict:
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
 
-def run_episode(env, agent, max_steps: int) -> Dict[str, Any]:
+REFLEXION_STEP_LIMIT = 30   # Reflexion paper: end trial after 30 steps
+REFLEXION_STUCK_WINDOW = 3  # same (action, obs) pair N times in a row → stuck
+
+
+def run_episode(
+    env,
+    agent,
+    max_steps: int,
+    reflexion_heuristic: bool = False,
+) -> Dict[str, Any]:
     """
     Run one episode.
     Returns dict with keys: success, steps, score, actions.
+
+    Args:
+        reflexion_heuristic: When True (used by ReflexionAgent), replace the
+            random loop-escape with early trial termination so the reflection
+            cycle can kick in.  The trial ends early if:
+              - the same (action, observation) pair occurs REFLEXION_STUCK_WINDOW
+                consecutive times (agent is stuck), OR
+              - REFLEXION_STEP_LIMIT steps have been taken (paper cap = 30).
     """
     try:
         obs, infos = env.reset()
@@ -119,6 +136,10 @@ def run_episode(env, agent, max_steps: int) -> Dict[str, Any]:
     actions_taken: List[str] = []
     loops_broken = 0
 
+    # Reflexion stuck-detection state
+    _prev_pair: Optional[Tuple[str, str]] = None
+    _stuck_count: int = 0
+
     for step in range(max_steps):
         admissible = infos.get("admissible_commands", [[]])[0]
         if not admissible:
@@ -130,14 +151,18 @@ def run_episode(env, agent, max_steps: int) -> Dict[str, Any]:
             console.print(f"    [red]Agent error at step {step}: {e}[/red]")
             action = admissible[0]   # fall back to first valid action
 
-        # Loop detection: escape if last LOOP_WINDOW actions are identical
-        if (len(actions_taken) >= LOOP_WINDOW
-                and len(set(actions_taken[-LOOP_WINDOW:])) == 1
-                and actions_taken[-1] == action):
-            alternatives = [cmd for cmd in admissible if cmd != action]
-            if alternatives:
-                action = random.choice(alternatives)
-                loops_broken += 1
+        if reflexion_heuristic:
+            # Do NOT randomly escape — let the heuristic terminate the trial early
+            pass
+        else:
+            # Loop detection: escape if last LOOP_WINDOW actions are identical
+            if (len(actions_taken) >= LOOP_WINDOW
+                    and len(set(actions_taken[-LOOP_WINDOW:])) == 1
+                    and actions_taken[-1] == action):
+                alternatives = [cmd for cmd in admissible if cmd != action]
+                if alternatives:
+                    action = random.choice(alternatives)
+                    loops_broken += 1
 
         next_obs, scores, dones, infos = env.step([action])
         next_obs = next_obs[0]
@@ -147,6 +172,19 @@ def run_episode(env, agent, max_steps: int) -> Dict[str, Any]:
         history.append((action, next_obs))
         actions_taken.append(action)
         obs = next_obs
+
+        if reflexion_heuristic:
+            # Heuristic early termination (Reflexion paper §4):
+            # end trial if agent is stuck or has exceeded the step budget,
+            # so the outer loop can generate a reflection and retry.
+            current_pair = (action, next_obs)
+            if current_pair == _prev_pair:
+                _stuck_count += 1
+            else:
+                _stuck_count = 1
+                _prev_pair = current_pair
+            if _stuck_count >= REFLEXION_STUCK_WINDOW or (step + 1) >= REFLEXION_STEP_LIMIT:
+                break
 
         if done:
             return {
@@ -237,7 +275,7 @@ def run_reflexion_trials(
                 break
 
             agent.reset_trial()
-            result = run_episode(trial_env, agent, max_steps)
+            result = run_episode(trial_env, agent, max_steps, reflexion_heuristic=True)
             if result is None:
                 break
 
@@ -309,7 +347,7 @@ def evaluate_reflexion_agent(
                     break
 
                 agent.reset_trial()
-                result = run_episode(trial_env, agent, max_steps)
+                result = run_episode(trial_env, agent, max_steps, reflexion_heuristic=True)
                 if result is None:
                     break
 
@@ -487,7 +525,7 @@ def parse_args():
     parser.add_argument("--model",       default=os.getenv("MODEL_NAME", "llama3.1:8b"))
     parser.add_argument("--num-games",   type=int, default=int(os.getenv("NUM_GAMES", "10")))
     parser.add_argument("--max-steps",   type=int, default=int(os.getenv("MAX_STEPS", "50")))
-    parser.add_argument("--agents",      nargs="+", default=["zero_shot", "few_shot", "cot", "react", "reflexion", "hierarchical"])
+    parser.add_argument("--agents",      nargs="+", default=["zero_shot", "few_shot", "react", "reflexion", "hierarchical_reflexion"])
     parser.add_argument("--output",      default="results/baseline_results.json")
     parser.add_argument("--checkpoint",  default=None,
                         help="Path for incremental checkpoint (enables resume on restart)")
@@ -529,12 +567,11 @@ def main():
     console.print()
 
     agent_registry = {
-        "zero_shot":    ZeroShotAgent(args.model, args.ollama_url),
-        "few_shot":     FewShotAgent(args.model, args.ollama_url),
-        "cot":          CotAgent(args.model, args.ollama_url),
-        "react":        ReActAgent(args.model, args.ollama_url),
-        "reflexion":    ReflexionAgent(args.model, args.ollama_url),
-        "hierarchical": HierarchicalAgent(args.model, args.ollama_url),
+        "zero_shot":               ZeroShotAgent(args.model, args.ollama_url),
+        "few_shot":                FewShotAgent(args.model, args.ollama_url),
+        "react":                   ReActAgent(args.model, args.ollama_url),
+        "reflexion":               ReflexionAgent(args.model, args.ollama_url),
+        "hierarchical_reflexion":  HierarchicalReflexionAgent(args.model, args.ollama_url),
     }
 
     # ── Load or initialise checkpoint ─────────────────────────────────────────
@@ -586,8 +623,11 @@ def main():
         }
 
         try:
+            # Route any agent with a multi-trial interface to the Reflexion evaluator.
+            # Covers both ReflexionAgent and HierarchicalReflexionAgent (duck-typing).
             evaluator = (
-                evaluate_reflexion_agent if agent_name == "reflexion"
+                evaluate_reflexion_agent
+                if hasattr(agent_registry[agent_name], "max_trials")
                 else evaluate_agent
             )
             result = evaluator(

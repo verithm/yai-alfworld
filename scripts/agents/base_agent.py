@@ -11,7 +11,20 @@ class BaseAgent(ABC):
         self.ollama_url = ollama_url.rstrip("/")
 
     def chat(self, messages: List[dict], max_tokens: int = 128) -> str:
-        """Send messages to Ollama and return the response text."""
+        """Send messages to Ollama and return the response text.
+
+        Inference hyperparameters (shared across ALL agents for experimental consistency):
+          temperature=0.1  — Near-deterministic but with slight stochasticity to break
+                             action loops; pure 0.0 causes identical repetitive outputs.
+                             Value is low enough that results are reproducible across runs.
+          num_predict      — Per-agent ceiling on output tokens; passed by caller
+                             (128 for action-only outputs, 200 for reasoning, 400 for JSON plans).
+          num_thread=12    — CPU threads for Ollama tokenisation on the VESSL GPU instance
+                             (16 vCPUs assigned, 12 reserved for LLM preprocessing).
+                             Has no effect on GPU matrix multiply, only on CPU-side work.
+          timeout=180      — 3-minute network timeout; generous for 8B model inference
+                             on an RTX 3090 (~0.5–2 s/step typical, worst-case ~30 s).
+        """
         response = requests.post(
             f"{self.ollama_url}/api/chat",
             json={
@@ -19,9 +32,9 @@ class BaseAgent(ABC):
                 "messages": messages,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,   # slight stochasticity to break loops
+                    "temperature": 0.1,
                     "num_predict": max_tokens,
-                    "num_thread": 12,     # match CPU thread allocation
+                    "num_thread": 12,
                 },
             },
             timeout=180,

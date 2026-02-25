@@ -178,7 +178,10 @@ class HierarchicalAgent(BaseAgent):
         subgoal = self._current_subgoal()
         compact_state = _compact_obs(observation)
 
-        # Last 3 (action, obs) turns in compact form
+        # Last 3 (action, obs) turns in compact form.
+        # HierarchicalAgent uses 3 turns (vs 5 in flat agents) because each entry
+        # already uses the compact observation (~220 chars), so the token budget
+        # per entry is ~4× smaller. 3 compact entries ≈ 5 full-obs entries in tokens.
         recent = history[-3:] if len(history) >= 3 else history
         history_str = "\n".join(
             f"  > {act}\n  {_compact_obs(obs)}" for act, obs in recent

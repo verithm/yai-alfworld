@@ -38,25 +38,6 @@ console = Console()
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
-def _extract_expert_plan(infos: dict) -> List[str]:
-    """
-    Robustly extract the expert plan list from infos.
-
-    ALFWorld can return the plan in two formats:
-      Nested  (standard batched env): [["step1", "step2", ...]]  → take [0]
-      Flat    (some env versions):    ["step1", "step2", ...]     → use as-is
-    Also handles None / missing key gracefully.
-    """
-    raw = infos.get("extra.expert_plan")
-    if not raw:
-        return []
-    first = raw[0]
-    if isinstance(first, list):
-        return first           # Nested: [["s1","s2"]] → ["s1","s2"]
-    if isinstance(first, str):
-        return list(raw)       # Flat:   ["s1","s2"]   → ["s1","s2"]
-    return []
-
 
 def _match_oracle_action(oracle_action: str, admissible: List[str]) -> Optional[str]:
     """
@@ -115,14 +96,20 @@ def load_config(config_path: str, data_path: str) -> dict:
 def _collect_trajectory(
     initial_obs: str,
     initial_infos: dict,
-    expert_plan: List[str],
     env,
     gamefile: str,
     max_steps: int,
 ) -> Optional[Dict[str, Any]]:
     """
-    Follow the expert_plan action-by-action and build a multi-turn SFT record.
+    Follow the handcoded oracle step-by-step and build a multi-turn SFT record.
     Returns None if the episode did not end in success.
+
+    IMPORTANT — oracle interaction model:
+      The ALFWorld handcoded oracle is stateful and returns ONE action at a time.
+      infos["extra.expert_plan"][0] holds the next recommended action for the
+      current world state.  The environment recomputes this recommendation after
+      every env.step() call.  We must NOT pre-fetch the full plan at reset time;
+      instead we re-read the oracle recommendation at every step.
     """
     obs   = initial_obs
     infos = initial_infos
@@ -133,15 +120,28 @@ def _collect_trajectory(
 
     success = False
 
-    for step, oracle_action in enumerate(expert_plan):
-        if step >= max_steps:
-            break
-
+    for _step in range(max_steps):
         admissible: List[str] = (infos.get("admissible_commands") or [[]])[0]
         if not admissible:
             break
 
-        # Find the matching admissible action (handles case/whitespace and "in/on" templates)
+        # Read the oracle's recommendation for the current state (one action at a time)
+        raw_plan = infos.get("extra.expert_plan") or []
+        if not raw_plan:
+            break
+        first = raw_plan[0]
+        if isinstance(first, list):
+            # Nested batched format [[action]] — unwrap inner list
+            oracle_action: Optional[str] = first[0] if first else None
+        elif isinstance(first, str):
+            oracle_action = first
+        else:
+            oracle_action = None
+
+        if not oracle_action:
+            break
+
+        # Match to admissible set (handles case/whitespace and "in/on" templates)
         matched = _match_oracle_action(oracle_action, admissible)
         if matched is None:
             return None
@@ -265,19 +265,17 @@ def main() -> None:
                 obs_str   = obs[0]
                 gamefile  = str((infos.get("extra.gamefile") or [""])[0])
 
-                # The handcoded oracle plan is provided per-game in infos
-                expert_plan: List[str] = _extract_expert_plan(infos)
-
-                if not expert_plan:
+                # Verify the oracle is active for this game before attempting collection
+                if not infos.get("extra.expert_plan"):
                     skipped += 1
                     progress.update(
                         prog_task,
-                        description=f"collected={collected} skipped={skipped} (no oracle plan)",
+                        description=f"collected={collected} skipped={skipped} (no oracle)",
                     )
                     continue
 
                 record = _collect_trajectory(
-                    obs_str, infos, expert_plan, env, gamefile, args.max_steps
+                    obs_str, infos, env, gamefile, args.max_steps
                 )
 
                 if record is None:

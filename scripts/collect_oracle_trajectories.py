@@ -35,6 +35,57 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 console = Console()
 
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+
+def _extract_expert_plan(infos: dict) -> List[str]:
+    """
+    Robustly extract the expert plan list from infos.
+
+    ALFWorld can return the plan in two formats:
+      Nested  (standard batched env): [["step1", "step2", ...]]  → take [0]
+      Flat    (some env versions):    ["step1", "step2", ...]     → use as-is
+    Also handles None / missing key gracefully.
+    """
+    raw = infos.get("extra.expert_plan")
+    if not raw:
+        return []
+    first = raw[0]
+    if isinstance(first, list):
+        return first           # Nested: [["s1","s2"]] → ["s1","s2"]
+    if isinstance(first, str):
+        return list(raw)       # Flat:   ["s1","s2"]   → ["s1","s2"]
+    return []
+
+
+def _match_oracle_action(oracle_action: str, admissible: List[str]) -> Optional[str]:
+    """
+    Return the admissible action that best matches oracle_action, or None.
+
+    Tries in order:
+      1. Exact match
+      2. Case-insensitive + stripped match (handles whitespace/capitalisation diffs)
+      3. "in/on" template expansion — oracle may emit "put X in/on Y" while
+         admissible has separate "put X in Y" / "put X on Y" entries.
+    """
+    if oracle_action in admissible:
+        return oracle_action
+    norm = oracle_action.strip().lower()
+    for a in admissible:
+        if a.strip().lower() == norm:
+            return a
+    if "in/on" in oracle_action:
+        for prep in ("in", "on"):
+            variant = oracle_action.replace("in/on", prep)
+            if variant in admissible:
+                return variant
+            variant_norm = variant.strip().lower()
+            for a in admissible:
+                if a.strip().lower() == variant_norm:
+                    return a
+    return None
+
+
 # ── System prompt used for every SFT example ──────────────────────────────────
 
 SYSTEM_PROMPT = """\
@@ -90,10 +141,11 @@ def _collect_trajectory(
         if not admissible:
             break
 
-        # Skip this game if the oracle action is not in the admissible set
-        # (can happen with version mismatches or partial game files)
-        if oracle_action not in admissible:
+        # Find the matching admissible action (handles case/whitespace and "in/on" templates)
+        matched = _match_oracle_action(oracle_action, admissible)
+        if matched is None:
             return None
+        oracle_action = matched
 
         user_turn = (
             f"Observation: {obs}\n\n"
@@ -214,9 +266,7 @@ def main() -> None:
                 gamefile  = str((infos.get("extra.gamefile") or [""])[0])
 
                 # The handcoded oracle plan is provided per-game in infos
-                expert_plan: List[str] = (
-                    infos.get("extra.expert_plan") or [[]]
-                )[0]
+                expert_plan: List[str] = _extract_expert_plan(infos)
 
                 if not expert_plan:
                     skipped += 1

@@ -38,7 +38,7 @@ Phase 2 consists of two steps:
   Step A — Oracle Data Collection
     Run collect_oracle_trajectories.py against the ALFWorld *training* split.
     The ALFWorld handcoded oracle generates expert action sequences at runtime.
-    Output: results/oracle/trajectories.jsonl  (~3 500 games)
+    Output: results/oracle/trajectories.jsonl  (~2 500–3 000 games)
 
   Step B — SFT Training
     Fine-tune Llama-3.1-8B with QLoRA on the collected JSONL.
@@ -67,19 +67,21 @@ python scripts/collect_oracle_trajectories.py \
   --max-steps 50
 ```
 
-**Expected output**: ~2 000–2 500 successful JSONL records (games where oracle score > 0).
+**Expected output**: ~2 500–3 000 successful JSONL records (games where oracle score > 0).
 Each record is one multi-turn chat conversation:
 
 ```json
 {
-  "system": "You are a household robot...",
-  "conversations": [
-    {"role": "user",      "content": "Task: ...\nObservation: ..."},
+  "messages": [
+    {"role": "system",    "content": "You are a household robot..."},
+    {"role": "user",      "content": "Observation: ...\n\nAdmissible actions:\n  - look\n  - ..."},
     {"role": "assistant", "content": "go to countertop 1"},
-    {"role": "user",      "content": "Observation: You arrive at countertop 1..."},
+    {"role": "user",      "content": "Observation: You arrive at countertop 1...\n\nAdmissible actions:\n  - ..."},
     {"role": "assistant", "content": "pick up mug 1"},
     ...
-  ]
+  ],
+  "gamefile": "/data/alfworld/json_2.1.1/train/.../game.tw-pddl",
+  "steps": 12
 }
 ```
 
@@ -90,7 +92,7 @@ python3 -c "
 import json
 records = [json.loads(l) for l in open('results/oracle/trajectories.jsonl')]
 print(f'Total records: {len(records)}')
-turns = [len(r['conversations']) for r in records]
+turns = [(len(r['messages']) - 1) // 2 for r in records]
 print(f'Avg turns per record: {sum(turns)/len(turns):.1f}')
 print('Sample keys:', list(records[0].keys()))
 "
@@ -188,7 +190,7 @@ parser.add_argument("--base",   default="meta-llama/Llama-3.1-8B")
 parser.add_argument("--epochs", type=int, default=3)
 parser.add_argument("--batch",  type=int, default=4)
 parser.add_argument("--lr",     type=float, default=2e-4)
-parser.add_argument("--max-seq-len", type=int, default=2048)
+parser.add_argument("--max-seq-len", type=int, default=8192)
 args = parser.parse_args()
 
 
@@ -199,11 +201,13 @@ def load_jsonl(path: str):
         return [json.loads(line) for line in f if line.strip()]
 
 def format_record(record: dict, tokenizer) -> str:
-    """Convert a chat record to the model's chat template format."""
-    messages = [{"role": "system", "content": record["system"]}]
-    messages += record["conversations"]
+    """Convert a chat record to the model's chat template format.
+
+    Data schema: {"messages": [{"role": "system", ...}, ...], "gamefile": ..., "steps": N}
+    The system prompt is already embedded as messages[0].
+    """
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False
+        record["messages"], tokenize=False, add_generation_prompt=False
     )
 
 raw = load_jsonl(args.data)
@@ -224,7 +228,7 @@ if USE_UNSLOTH:
         r=16,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                          "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=16,
+        lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
         use_gradient_checkpointing="unsloth",
@@ -247,7 +251,7 @@ else:
     model = prepare_model_for_kbit_training(model)
     lora_config = LoraConfig(
         r=16,
-        lora_alpha=16,
+        lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
@@ -346,8 +350,12 @@ print("Merged model saved to results/sft_merged/")
 EOF
 
 # Convert to GGUF and register with Ollama
-# (requires llama.cpp convert_hf_to_gguf.py)
-python3 convert_hf_to_gguf.py results/sft_merged/ --outfile results/llama3.1-8b-sft.gguf --outtype q4_k_m
+# Requires llama.cpp — clone it if not already present
+git clone --depth 1 https://github.com/ggerganov/llama.cpp.git /tmp/llama.cpp
+pip install -r /tmp/llama.cpp/requirements.txt
+
+python3 /tmp/llama.cpp/convert_hf_to_gguf.py results/sft_merged/ \
+  --outfile results/llama3.1-8b-sft.gguf --outtype q4_k_m
 ollama create llama3.1:8b-sft -f - <<'MODELFILE'
 FROM ./results/llama3.1-8b-sft.gguf
 MODELFILE

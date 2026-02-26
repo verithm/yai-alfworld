@@ -239,6 +239,7 @@ def main() -> None:
     collected = 0
     skipped   = 0
     attempted = 0
+    seen_gamefiles: set = set()
 
     with open(out_path, "w") as fout:
         with Progress(
@@ -264,6 +265,13 @@ def main() -> None:
                 attempted += 1
                 obs_str   = obs[0]
                 gamefile  = str((infos.get("extra.gamefile") or [""])[0])
+
+                # AlfredTWEnv cycles back to the start after exhausting all games
+                # instead of raising StopIteration — detect the wrap-around and stop.
+                if gamefile and gamefile in seen_gamefiles:
+                    break
+                if gamefile:
+                    seen_gamefiles.add(gamefile)
 
                 # Verify the oracle is active for this game before attempting collection
                 if not infos.get("extra.expert_plan"):

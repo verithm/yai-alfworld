@@ -1,21 +1,22 @@
-# Week 1 — ALFWorld Baseline Evaluation
+# ALFWorld LLM Agent Evaluation
 
 Text-based household task environment using **ALFWorld (text-only mode)** with
-**Llama-3.1-8B** served locally via **Ollama** (CPU inference, Q4_K_M ~5 GB RAM).
+**Llama-3.1-8B** served via **Ollama**.
 
 ---
 
 ## Hardware Requirements
 
-| Component | Minimum | This Machine |
-|-----------|---------|--------------|
-| CPU       | AVX2 support | AMD Ryzen 7 4800U (8c/16t, AVX2 ✓) |
-| RAM       | 10 GB   | 14 GB |
-| Storage   | 8 GB free | 393 GB NVMe |
-| GPU       | Not required | Integrated AMD Radeon (CPU-only) |
+Experiments are run on **VESSL** GPU workspaces.
 
-> **No NVIDIA GPU required.** Inference runs on CPU via llama.cpp inside Ollama.
-> Expect ~1–3 tokens/second; 10 games per agent takes ~30–90 minutes.
+| Component | Spec |
+|-----------|------|
+| GPU       | NVIDIA RTX 3090 (24 GB VRAM) |
+| Model     | `llama3.1:8b` via Ollama (Q4_K_M, ~5 GB VRAM) |
+| Execution | Native Python — no Docker on VESSL |
+
+> GPU inference via Ollama on the RTX 3090 gives ~50–80 tokens/second.
+> A 134-game full evaluation takes roughly 2–4 hours per agent.
 
 ---
 
@@ -23,100 +24,130 @@ Text-based household task environment using **ALFWorld (text-only mode)** with
 
 ```
 nlp_ws/
-├── Dockerfile                    # ALFWorld + evaluation environment
-├── docker-compose.yml            # Ollama (LLM) + ALFWorld (eval) services
+├── Dockerfile                    # ALFWorld + evaluation environment (local Docker)
+├── docker-compose.yml            # Ollama + ALFWorld services (local Docker)
 ├── requirements.txt
-├── entrypoint.sh                 # Startup: wait for Ollama, pull model, run eval
 ├── configs/
 │   └── alfworld_config.yaml      # ALFWorld env settings
 ├── scripts/
-│   ├── run_baseline.py           # Main evaluation script
+│   ├── run_baseline.py                     # Main evaluation script
+│   ├── collect_oracle_trajectories.py      # Phase 2: extract text oracle data for SFT
 │   └── agents/
-│       ├── base_agent.py         # Shared Ollama client + command matching
-│       ├── zero_shot_agent.py    # Zero-shot prompting
-│       ├── few_shot_agent.py     # Few-shot with 3 curated demonstrations
-│       └── react_agent.py        # ReAct (Thought + Action loop)
+│       ├── base_agent.py                   # Shared Ollama client + command matching
+│       ├── zero_shot_agent.py              # Zero-shot prompting
+│       ├── few_shot_agent.py               # Few-shot with 3 curated demonstrations
+│       ├── react_agent.py                  # ReAct (Thought + Action loop)
+│       ├── reflexion_agent.py              # Reflexion (ReAct + verbal self-correction)
+│       └── hierarchical_agent.py # Hierarchical planning + Reflexion (SOTA)
 ├── data/                         # ALFWorld game files (auto-downloaded, ~800 MB)
 └── results/                      # JSON results written here
 ```
 
 ---
 
-## Quick Start
+## Quick Start (VESSL)
 
-### Step 1 — Build the image
+All experiments run natively on VESSL GPU workspaces — no Docker required.
+
+### Step 1 — Open a VESSL workspace and install dependencies
+
+```bash
+pip install alfworld textworld rich
+```
+
+### Step 2 — Start Ollama and pull the model
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
+sleep 10
+ollama pull llama3.1:8b
+```
+
+### Step 3 — Download ALFWorld game data (first time only)
+
+```bash
+export ALFWORLD_DATA=~/data/alfworld
+mkdir -p "$ALFWORLD_DATA"
+alfworld-download
+```
+
+### Step 4 — Run the full OOD evaluation
 
 ```bash
 cd ~/nlp_ws
-docker compose build
+python scripts/run_baseline.py \
+  --agents zero_shot few_shot react reflexion hierarchical \
+  --num-games 134 \
+  --max-steps 50 \
+  --split eval_out_of_distribution \
+  --checkpoint results/checkpoint.json \
+  --output    results/baseline_results.json
 ```
 
-### Step 2 — Run the full baseline evaluation
+### Step 5 — Check results
 
 ```bash
-docker compose up
-```
-
-On **first run** this will:
-1. Start Ollama (CPU mode)
-2. Pull `llama3.1:8b` (~4.9 GB download — one time only, cached in `ollama_data` volume)
-3. Download ALFWorld game files (~800 MB — one time only, cached in `./data/`)
-4. Run Zero-shot → Few-shot → ReAct evaluation (10 games each)
-5. Write `results/baseline_results.json`
-
-Subsequent runs skip the downloads and start the evaluation immediately.
-
-### Step 3 — Check results
-
-```bash
-cat results/baseline_results.json | python3 -m json.tool
+python3 -c "
+import json
+d = json.load(open('results/baseline_results.json'))
+for agent, info in d.get('agents', {}).items():
+    print(f\"{agent:<28} SR={info['success_rate']:.1%}  avg_steps={info.get('avg_steps', 0):.1f}\")
+"
 ```
 
 ---
 
 ## Configuration
 
-All parameters can be overridden via environment variables or CLI flags.
-
-### docker-compose.yml environment block
-
-```yaml
-environment:
-  MODEL_NAME: "llama3.1:8b"   # any model pulled into Ollama
-  NUM_GAMES:  "10"             # games per agent (increase for final eval)
-  MAX_STEPS:  "50"             # max actions per episode
-```
+All parameters are passed as CLI flags to `run_baseline.py`.
 
 ### Run only specific agents
 
 ```bash
-docker compose run --rm alfworld \
-    python scripts/run_baseline.py --agents zero_shot react
+python scripts/run_baseline.py \
+  --agents react reflexion hierarchical \
+  --num-games 134 --max-steps 50
+```
+
+### Run a quick smoke test (2 games per agent, ~10–15 min)
+
+```bash
+python scripts/run_baseline.py \
+  --agents zero_shot few_shot react reflexion hierarchical \
+  --num-games 2 --max-steps 20 \
+  --output results/smoke_results.json
+```
+
+### Resume an interrupted run from a checkpoint
+
+```bash
+python scripts/run_baseline.py \
+  --agents zero_shot few_shot react reflexion hierarchical \
+  --num-games 134 \
+  --checkpoint results/checkpoint.json \
+  --output    results/baseline_results.json
 ```
 
 ### Run against the in-distribution split
 
 ```bash
-docker compose run --rm alfworld \
-    python scripts/run_baseline.py --split eval_in_distribution
-```
-
-### Run with more games for a proper benchmark
-
-```bash
-docker compose run --rm alfworld \
-    python scripts/run_baseline.py --num-games 50
+python scripts/run_baseline.py \
+  --agents zero_shot few_shot react reflexion hierarchical \
+  --num-games 134 --split eval_in_distribution
 ```
 
 ---
 
 ## Prompting Strategies
 
-| Strategy   | Description |
-|------------|-------------|
+| Agent | Description |
+|-------|-------------|
 | **Zero-shot** | System instruction only; model sees current observation + recent history |
 | **Few-shot**  | 3 curated ALFWorld task demonstrations prepended to every prompt |
-| **ReAct**     | Explicit `Thought: …` + `Action: …` output format; full scratchpad maintained across steps |
+| **ReAct**     | Explicit `Thought: …` + `Action: …` scratchpad maintained across steps |
+| **Reflexion** | ReAct actor + verbal self-critique after each failed trial; up to 3 retries per game |
+| **Hierarchical** | Two-pass architecture: LLM planner generates subgoal sequence; executor follows each subgoal; Reflexion self-critique targets the planner on retry |
 
 ---
 
@@ -135,37 +166,135 @@ docker compose run --rm alfworld \
 
 ## Troubleshooting
 
-**Ollama never becomes healthy**
+**Ollama not responding**
 ```bash
-docker compose logs ollama
-# Should see "Listening on [::]:11434"
+# Check if the server is running
+curl http://localhost:11434/api/tags
+# If not, restart it
+ollama serve &
 ```
 
 **Model pull stalls or fails**
 ```bash
-# Pull manually on the host, then restart
-docker compose exec ollama ollama pull llama3.1:8b
+# Retry the pull directly
+ollama pull llama3.1:8b
+# Verify it's available
+ollama list
 ```
 
-**ALFWorld data download fails inside container**
+**ALFWorld data not found**
 ```bash
-# Download on the host and copy to ./data/
-docker compose run --rm --entrypoint bash alfworld
-$ alfworld-download
+# Ensure ALFWORLD_DATA points to the right directory
+export ALFWORLD_DATA=~/data/alfworld
+alfworld-download
 ```
 
-**Out-of-memory during evaluation**
-Lower `NUM_GAMES` or reduce `memory` limits in `docker-compose.yml`.
+**Evaluation interrupted mid-run**
+Pass `--checkpoint results/checkpoint.json` — the run will resume from the last completed game.
 
 ---
 
-## Week 2 Preview
+## Project Roadmap
 
-- Oracle trajectory collection (10k episodes) from `train` split
-- LoRA SFT on collected data using Unsloth / HuggingFace PEFT
-- Training will require the A100 cluster (data center back online)
+| Phase | Description | Status |
+|-------|-------------|--------|
+| **Phase 1** | Baseline agent evaluation — all 5 agents on ALFWorld OOD split | 🔄 In progress |
+| **Phase 2** | Supervised Fine-Tuning (SFT) — oracle collection + LoRA fine-tuning | ⏳ Planned |
+| **Phase 3** | Evaluation with the SFT model — Baseline vs SFT comparison | ⏳ Planned |
 
-## Week 3 Preview
+---
 
-- Reflexion module: on-failure → self-critique → retry loop
-- Final demo: compare Baseline vs SFT vs Reflexion success rates
+## Experiment Plan
+
+All experiments run on VESSL (`cluster: yonsei-ai-gpu`, `preset: gpu-1`,
+image `quay.io/vessl-ai/torch:2.3.1-cuda12.1-r5`, storage org `YS-YAI`).
+
+### VESSL Setup (one-time)
+
+Upload scripts and ALFWorld data to VESSL volumes before running any experiment:
+
+```bash
+# Upload scripts (zip the scripts/ and configs/ directories)
+vessl storage upload --volume alfworld-scripts scripts/ configs/
+
+# Upload ALFWorld game data (~800 MB)
+vessl storage upload --volume alfworld-data data/
+```
+
+Results are automatically written back to the `alfworld-results` volume at the end of each job.
+
+---
+
+### Phase 1 — Baseline Evaluation
+
+#### E0 · Smoke Test
+- **Purpose:** Verify GPU access, Ollama serving, and all agent imports before committing to a long run.
+- **Scope:** 2 games × 5 agents (~10–15 min)
+- **Command:**
+  ```bash
+  python scripts/run_baseline.py \
+    --agents zero_shot few_shot react reflexion hierarchical \
+    --num-games 2 --max-steps 20 \
+    --split eval_out_of_distribution \
+    --output results/e0_smoke_results.json
+  ```
+
+#### E1 · Full OOD Baseline
+- **Purpose:** Establish the definitive pre-SFT baseline for all 5 agents across the complete OOD dataset.
+- **Scope:** 134 games × 5 agents (full OOD split, ~4–6 h on RTX 3090). No specific target success rate — results are recorded as-is for comparison with Phase 3.
+- **Command:**
+  ```bash
+  python scripts/run_baseline.py \
+    --agents zero_shot few_shot react reflexion hierarchical \
+    --num-games 134 --max-steps 50 \
+    --split eval_out_of_distribution \
+    --checkpoint results/e1_checkpoint.json \
+    --output    results/e1_results.json
+  ```
+
+---
+
+### Phase 2 — Supervised Fine-Tuning
+
+ALFWorld provides a built-in `handcoded` oracle for every training game. However, the
+on-disk `traj_data.json` files use ALFRED vision-format actions (e.g. `GotoLocation`,
+`PickupObject`) — **not** the TextWorld text strings the LLM sees at runtime. The text
+oracle must be collected by stepping through the environment with `expert_type: handcoded`.
+
+#### Oracle Data Extraction
+
+```bash
+export ALFWORLD_DATA=~/data/alfworld
+python scripts/collect_oracle_trajectories.py \
+  --split train \
+  --output results/oracle/trajectories.jsonl
+```
+
+- **Source:** ALFWorld `handcoded` oracle — accessed via the Python env API at runtime
+- **Output:** `results/oracle/trajectories.jsonl` (saved to local workspace disk)
+- **Format:** one JSONL record per (system\_prompt, conversation) training example
+
+#### SFT Training
+- **Framework:** Unsloth + HuggingFace PEFT (LoRA)
+- **Input:** `results/oracle/trajectories.jsonl`
+- **Base model:** `meta-llama/Llama-3.1-8B`
+- **Target:** Fine-tuned adapter saved to `results/sft_adapter/`
+- **Full guide:** [`docs/sft_pipeline_guide.md`](docs/sft_pipeline_guide.md) — proven stable versions, step-by-step setup, training script, and troubleshooting
+
+---
+
+### Phase 3 — Evaluation with SFT Model
+
+Re-run the identical E1 evaluation with the SFT model:
+
+```bash
+python scripts/run_baseline.py \
+  --agents zero_shot few_shot react reflexion hierarchical \
+  --num-games 134 --max-steps 50 \
+  --model llama3.1:8b-sft \
+  --split eval_out_of_distribution \
+  --checkpoint results/e2_checkpoint.json \
+  --output    results/e2_sft_results.json
+```
+
+Final comparison: E1 (pre-SFT baseline) vs E2 (post-SFT) success rates per agent and per task type.

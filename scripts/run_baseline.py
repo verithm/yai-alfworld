@@ -3,7 +3,7 @@
 ALFWorld Baseline Evaluation
 =============================
 Evaluates five agents on ALFWorld text-only tasks using Llama-3.1-8B via Ollama:
-  zero_shot, few_shot, react, reflexion, hierarchical_reflexion.
+  zero_shot, few_shot, react, reflexion, hierarchical.
 
 Usage (inside Docker):
     python scripts/run_baseline.py [OPTIONS]
@@ -38,7 +38,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 # Make sure the scripts/ directory is importable
 sys.path.insert(0, str(Path(__file__).parent))
-from agents import ZeroShotAgent, FewShotAgent, ReActAgent, ReflexionAgent, HierarchicalReflexionAgent
+from agents import ZeroShotAgent, FewShotAgent, ReActAgent, ReflexionAgent, HierarchicalAgent
 
 console = Console()
 
@@ -525,7 +525,7 @@ def parse_args():
     parser.add_argument("--model",       default=os.getenv("MODEL_NAME", "llama3.1:8b"))
     parser.add_argument("--num-games",   type=int, default=int(os.getenv("NUM_GAMES", "10")))
     parser.add_argument("--max-steps",   type=int, default=int(os.getenv("MAX_STEPS", "50")))
-    parser.add_argument("--agents",      nargs="+", default=["zero_shot", "few_shot", "react", "reflexion", "hierarchical_reflexion"])
+    parser.add_argument("--agents",      nargs="+", default=["zero_shot", "few_shot", "react", "reflexion", "hierarchical"])
     parser.add_argument("--output",      default="results/baseline_results.json")
     parser.add_argument("--checkpoint",  default=None,
                         help="Path for incremental checkpoint (enables resume on restart)")
@@ -571,7 +571,7 @@ def main():
         "few_shot":                FewShotAgent(args.model, args.ollama_url),
         "react":                   ReActAgent(args.model, args.ollama_url),
         "reflexion":               ReflexionAgent(args.model, args.ollama_url),
-        "hierarchical_reflexion":  HierarchicalReflexionAgent(args.model, args.ollama_url),
+        "hierarchical":            HierarchicalAgent(args.model, args.ollama_url),
     }
 
     # ── Load or initialise checkpoint ─────────────────────────────────────────
@@ -624,7 +624,7 @@ def main():
 
         try:
             # Route any agent with a multi-trial interface to the Reflexion evaluator.
-            # Covers both ReflexionAgent and HierarchicalReflexionAgent (duck-typing).
+            # Covers both ReflexionAgent and HierarchicalAgent (duck-typing).
             evaluator = (
                 evaluate_reflexion_agent
                 if hasattr(agent_registry[agent_name], "max_trials")

@@ -156,6 +156,8 @@ _COMPLETION_PATTERNS: List[Tuple[re.Pattern, re.Pattern]] = [
     (re.compile(r"\bclean\b|\bwash\b",                 re.I), re.compile(r"clean|rinsed",                         re.I)),
     (re.compile(r"\bheat\b|\bmicrowav\b",              re.I), re.compile(r"heated|warm",                          re.I)),
     (re.compile(r"\bcool\b|\bfridg\b",                 re.I), re.compile(r"cool|cold",                            re.I)),
+    # Fix: use desklamp/lamp had no completion pattern → subgoal never advanced after successful use
+    (re.compile(r"\buse\b",                            re.I), re.compile(r"you turn on",                          re.I)),
     # Fix: require non-empty content — "you see nothing" must NOT advance the subgoal
     (re.compile(r"\bexamine\b|\blook at\b|\blook\b",   re.I), re.compile(r"you examine .+\S|you look .+\S|on the .+you see(?! nothing)|there(?:'s| is) .+\S", re.I)),
     # Fix: navigation subgoals previously had no completion pattern → subgoal index stuck at 0

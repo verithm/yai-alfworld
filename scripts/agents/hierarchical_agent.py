@@ -53,25 +53,36 @@ GROUNDING RULES (apply BEFORE generating subgoals):
    exact in-game name (e.g. "cloth 1", "mug 2") in every subgoal.
 2. If the target object is already visible in the initial observation, skip searching for it.
 3. If an object might be inside a container (fridge, cabinet, drawer, box), add
-   "open <container>" BEFORE the "pick up <object>" subgoal.
+   "open <container>" BEFORE the "take <object> from <container>" subgoal.
 4. For examine-in-light tasks: go to the desklamp first, turn it on, then examine the object.
 
+SUBGOAL VERBS — use ONLY these exact verb forms (the game rejects all others):
+  go to <location>              ← navigation
+  take <object> from <location> ← pick up (NEVER write "pick up", "grab", "get")
+  put <object> in/on <location> ← place   (NEVER write "place", "insert", "deposit")
+  open <container>
+  close <container>
+  clean <object> with sinkbasin <N>   ← cleaning (NEVER "rinse", "wash", "use water")
+  heat <object> with microwave <N>    ← heating  (NEVER "use microwave", "put in microwave")
+  cool <object> with fridge <N>       ← cooling  (NEVER "use fridge", "put in fridge")
+  use <object>
+  examine <object>
+
 CRITICAL — ALFWorld appliance rules (do NOT deviate):
-- To HEAT an object  → use "microwave" (never stove, oven, or burner)
-- To COOL an object  → use "fridge"    (never freezer or coffeemachine)
-- To CLEAN an object → subgoal must be "clean <object> with sinkbasin <N>"
-                       (never "use water", "rinse", "wash", or "move to sinkbasin")
-- To LIGHT/EXAMINE under light → use "desklamp": go to it, turn it on, THEN examine
+- To HEAT an object  → subgoal: "heat <object> with microwave <N>"  (never stove or burner)
+- To COOL an object  → subgoal: "cool <object> with fridge <N>"     (never freezer)
+- To CLEAN an object → subgoal: "clean <object> with sinkbasin <N>" (never rinse/wash)
+- To LIGHT/EXAMINE   → subgoal: "use desklamp <N>", then "examine <object>"
 
 Rules:
 - Each subgoal is a single imperative phrase (≤8 words).
 - Navigation subgoals use the form: "go to <location name>".
 - NO conditional subgoals (no "if", "or", "else", "unless").
-- Include ALL required intermediate steps (e.g. open container, clean before placing).
+- Include ALL required intermediate steps (e.g. open container before taking, clean before placing).
 - If the task goal mentions "light", "lamp", or "examine … under", add
-  "turn on desklamp N" as a subgoal BEFORE the examine subgoal.
+  "use desklamp N" as a subgoal BEFORE the examine subgoal.
 - Output ONLY valid JSON, nothing else. Example:
-  ["go to countertop 1", "pick up mug 1", "go to microwave 1", "heat mug 1 in microwave 1", "go to countertop 2", "place mug 1 on countertop 2"]
+  ["go to countertop 1", "take mug 1 from countertop 1", "go to microwave 1", "heat mug 1 with microwave 1", "go to countertop 2", "put mug 1 in/on countertop 2"]
 """
 
 # Split into static system instructions and dynamic per-step user context.
@@ -90,18 +101,26 @@ Write your reflection as JSON with these exact fields:
   "task_goal": "brief description of what was required",
   "failed_subgoal": "the subgoal that went wrong or where the agent got stuck",
   "failure_reason": "one of: wrong_location | missing_step | wrong_object | stuck_in_loop | premature_completion",
-  "missing_steps": ["any step absent from the plan that caused failure"],
-  "revised_strategy": "specific instruction for the next plan (e.g. 'add open fridge 1 before pick up; search shelf 1 first')"
+  "missing_steps": ["exact ALFWorld action strings that were absent from the plan"],
+  "revised_strategy": "specific instruction for the next plan"
 }
+
+CRITICAL — missing_steps must be valid ALFWorld action strings using ONLY these verbs:
+  go to <X>  |  take <X> from <Y>  |  put <X> in/on <Y>  |  open <X>  |  close <X>
+  clean <X> with sinkbasin <N>  |  heat <X> with microwave <N>  |  cool <X> with fridge <N>
+  use <X>  |  examine <X>
+
+NEVER write "pick up", "place", "insert", "grab", "move", or natural-language phrases.
+Each entry in missing_steps must be a single action string the robot can execute directly.
 
 Be concrete. Generic statements like "I failed" or "try harder" are useless.
 Example:
 {
-  "task_goal": "find and heat a mug",
-  "failed_subgoal": "pick up mug 1",
+  "task_goal": "find and heat a mug, put it on countertop",
+  "failed_subgoal": "take mug 1 from countertop 1",
   "failure_reason": "wrong_location",
-  "missing_steps": ["open cabinet 1"],
-  "revised_strategy": "Mug was in cabinet 1, not on counter. Add 'open cabinet 1' before 'pick up mug 1'."
+  "missing_steps": ["go to cabinet 1", "open cabinet 1", "take mug 1 from cabinet 1"],
+  "revised_strategy": "Mug was in cabinet 1, not on countertop. Go to cabinet 1, open it, then take the mug."
 }
 """
 

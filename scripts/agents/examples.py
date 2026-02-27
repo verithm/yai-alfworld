@@ -351,6 +351,11 @@ _EXAMPLES: Dict[str, Dict] = {
                 "use desklamp 1",
                 "You turn on the desklamp 1.",
             ),
+            (
+                "Now the desklamp is on. Next, I need to examine the mug with it.",
+                "examine mug 1",
+                "You examine the mug 1.",
+            ),
         ],
     ),
 }

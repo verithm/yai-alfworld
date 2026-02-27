@@ -1,12 +1,14 @@
 """
 Hierarchical Agent for ALFWorld
 ================================
-Two-pass architecture with Reflexion self-correction:
+Two-pass architecture with Reflexion self-correction.
 
-  Pass 1 (planning): given the task description + initial observation,
-                     produce an ordered JSON list of subgoals.
-  Pass 2 (execution): for each active subgoal, choose one action using
-                      compact state + last 3 (action, obs) turns.
+Extends ReflexionAgent (Reflexion + Planning):
+  - Inherits: multi-trial loop, reflection storage, add_reflection(), reset()
+  - Adds:     Pass 1 (LLM planner → ordered JSON subgoal list per trial)
+              Pass 2 (executor picks one action per step guided by current subgoal)
+              Structured JSON reflection (overrides ReflexionAgent.reflect()) that
+              critiques the PLAN rather than step-level execution.
 
 On failed trials, a verbal reflection critiques the PLAN (wrong subgoal
 sequence, missing steps, wrong location prediction).  All reflections are
@@ -35,7 +37,7 @@ import json
 import re
 from typing import List, Tuple, Optional
 
-from .base_agent import BaseAgent
+from .reflexion_agent import ReflexionAgent
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -44,9 +46,11 @@ You are a task planner for a household robot in a text-based game.
 Given a task goal and an initial room description, output a JSON array
 of short, ordered subgoals that will complete the task.
 
-GROUNDING RULES (apply before generating subgoals):
-1. Read the initial observation and identify the exact names of visible objects.
-   Use those exact names (e.g. "mug 1", "drawer 2") in subgoals — never generic names.
+GROUNDING RULES (apply BEFORE generating subgoals):
+1. Read "Your task is to: …" to identify the TARGET OBJECT (e.g. "cloth", "mug", "apple").
+   The target object is ALWAYS the one named in the task description — never a different
+   visible object. Then find the target object in the initial observation and use its
+   exact in-game name (e.g. "cloth 1", "mug 2") in every subgoal.
 2. If the target object is already visible in the initial observation, skip searching for it.
 3. If an object might be inside a container (fridge, cabinet, drawer, box), add
    "open <container>" BEFORE the "pick up <object>" subgoal.
@@ -55,7 +59,8 @@ GROUNDING RULES (apply before generating subgoals):
 CRITICAL — ALFWorld appliance rules (do NOT deviate):
 - To HEAT an object  → use "microwave" (never stove, oven, or burner)
 - To COOL an object  → use "fridge"    (never freezer or coffeemachine)
-- To CLEAN an object → use "sinkbasin" (never dishwasher or sink)
+- To CLEAN an object → subgoal must be "clean <object> with sinkbasin <N>"
+                       (never "use water", "rinse", "wash", or "move to sinkbasin")
 - To LIGHT/EXAMINE under light → use "desklamp": go to it, turn it on, THEN examine
 
 Rules:
@@ -69,29 +74,13 @@ Rules:
   ["go to countertop 1", "pick up mug 1", "go to microwave 1", "heat mug 1 in microwave 1", "go to countertop 2", "place mug 1 on countertop 2"]
 """
 
-EXECUTOR_SYSTEM = """\
-You are a household robot choosing one action per step.
-
-Overall task: {task_context}
-Current subgoal: {subgoal}
-
-Recent history (action → result):
-{history}
-
-Current state:
-{state}
-
-Admissible actions:
-{actions}
-
-Notes:
-- If the subgoal mentions "turn on", choose the "turn on <object>" action from the list.
-- If the subgoal mentions "examine" and a desklamp is in the admissible actions, ensure
-  the lamp is already on (check history). If not, turn it on first.
-
-Reply with ONLY the exact action string from the admissible list above.
-Do not explain. Do not add punctuation.
-"""
+# Split into static system instructions and dynamic per-step user context.
+# The system prompt goes in role="system"; dynamic context in role="user".
+EXECUTOR_SYSTEM_PROMPT = (
+    "You are a household robot completing tasks in a text-based environment.\n"
+    "At each step you are given the current observation and a list of admissible actions.\n"
+    "Reply with ONLY the exact action string from the admissible list. Do not explain."
+)
 
 HIER_REFLECT_SYSTEM = """\
 You are reviewing a failed text-based household task to improve the next plan.
@@ -169,17 +158,20 @@ def _subgoal_completed(subgoal: str, last_obs: str) -> bool:
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
-class HierarchicalAgent(BaseAgent):
+class HierarchicalAgent(ReflexionAgent):
     """
-    Hierarchical agent with Reflexion self-correction.
+    Hierarchical agent — Reflexion + Planning.
 
-    Two-pass architecture:
+    Inherits ReflexionAgent's multi-trial reflection loop and adds a planning layer:
+
       Pass 1 (planning)   — LLM produces an ordered JSON subgoal list once per trial.
       Pass 2 (execution)  — executor picks one action per step guided by current subgoal.
 
-    After each failed trial a verbal reflection critiques the plan.  All
-    reflections are injected into the Planner prompt so the model re-plans
-    with explicit memory of its own mistakes (up to max_trials iterations).
+    Reflection targets the planner (not the executor): after each failed trial,
+    a structured JSON reflection critiques the plan (wrong subgoal sequence,
+    missing steps, wrong location).  All reflections are injected into the
+    Planner prompt on the next trial so the model re-plans with explicit memory
+    of its own mistakes (up to max_trials iterations).
 
     Episode flow:
       step 0  → _plan() → populate self._subgoals
@@ -187,9 +179,8 @@ class HierarchicalAgent(BaseAgent):
     """
 
     def __init__(self, model_name: str, ollama_url: str, max_trials: int = 3):
-        super().__init__(model_name, ollama_url)
-        self.max_trials = max_trials
-        self.reflections: List[str] = []   # persists across trials of one game
+        super().__init__(model_name, ollama_url, max_trials)
+        # Hierarchical-specific state; reflections + max_trials come from ReflexionAgent
         self._subgoals: List[str] = []
         self._subgoal_idx: int = 0
         self._subgoal_steps: int = 0       # consecutive steps spent on current subgoal
@@ -199,8 +190,8 @@ class HierarchicalAgent(BaseAgent):
     # ── State management ────────────────────────────────────────────────────────
 
     def reset(self):
-        """Between games: clear reflections and all plan state."""
-        self.reflections = []
+        """Between games: clear reflections (via super) and all plan state."""
+        super().reset()   # clears self.reflections, _react_history, _task_type
         self._subgoals = []
         self._subgoal_idx = 0
         self._subgoal_steps = 0
@@ -209,12 +200,12 @@ class HierarchicalAgent(BaseAgent):
 
     def reset_trial(self):
         """Between trials of the same game: clear per-trial plan, keep reflections."""
+        super().reset_trial()   # clears _react_history; self.reflections preserved
         self._subgoals = []
         self._subgoal_idx = 0
         self._subgoal_steps = 0
         self._initial_obs = ""
         self._last_subgoals = []
-        # self.reflections is preserved so the next trial's planner sees them
 
     # ── Public interface ────────────────────────────────────────────────────────
 
@@ -274,8 +265,9 @@ class HierarchicalAgent(BaseAgent):
                 "Lessons from your previous failed attempts on this task"
                 " (treat as hard constraints — do NOT repeat these mistakes):\n"
                 + reflection_block
-                + "\n\nFor each reflection that mentions a missing step, add it to your plan.\n"
-                + "For each reflection that mentions a wrong location, revise the navigation order.\n\n"
+                + "\n\nEach reflection is JSON. Read the 'missing_steps' array and add"
+                  " every listed step to your plan.\n"
+                + "Read 'revised_strategy' and follow it exactly when generating subgoals.\n\n"
                 + PLANNER_SYSTEM
             )
 
@@ -311,33 +303,34 @@ class HierarchicalAgent(BaseAgent):
         initial_obs: str = "",
     ) -> str:
         subgoal = self._current_subgoal()
-        compact_state = _compact_obs(observation)
+        cmds_str = "\n".join(f"  - {c}" for c in admissible_commands)
 
-        # Last 3 (action, obs) turns in compact form.
-        # HierarchicalAgent uses 3 turns (vs 5 in flat agents) because each entry
-        # already uses the compact observation (~220 chars), so the token budget
-        # per entry is ~4× smaller. 3 compact entries ≈ 5 full-obs entries in tokens.
-        recent = history[-3:] if len(history) >= 3 else history
-        history_str = "\n".join(
-            f"  > {act}\n  {_compact_obs(obs)}" for act, obs in recent
-        ) or "  (start of episode)"
-
-        prompt = EXECUTOR_SYSTEM.format(
-            task_context=initial_obs[:300] if initial_obs else "complete the household task",
-            subgoal=subgoal,
-            history=history_str,
-            state=compact_state,
-            actions="\n".join(f"  - {c}" for c in admissible_commands),
+        # Build current user turn: subgoal context + raw observation + admissible actions
+        current_user = (
+            f"Current subgoal: {subgoal}\n\n"
+            f"Observation: {observation}\n\n"
+            f"Admissible actions:\n{cmds_str}"
         )
-        messages = [{"role": "user", "content": prompt}]
-        raw = self.chat(messages, max_tokens=128)
+
+        # Build multi-turn message list (last 3 history pairs)
+        messages: List[dict] = [
+            {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT}
+        ]
+        for action, obs in history[-3:]:
+            messages.append({"role": "user",      "content": f"Observation: {obs}"})
+            messages.append({"role": "assistant",  "content": action})
+        messages.append({"role": "user", "content": current_user})
+
+        raw = self.chat(messages, max_tokens=32)
         return self.match_command(raw, admissible_commands)
 
     # ── Reflection generation ────────────────────────────────────────────────────
 
     def reflect(self, initial_obs: str, trajectory: List[Tuple[str, str]]) -> str:
         """
-        Generate a verbal reflection after a failed episode.
+        Generate a structured JSON reflection after a failed episode.
+        Overrides ReflexionAgent.reflect() to critique the PLAN rather than
+        step-level execution, and to emit structured JSON consumed by _plan().
 
         Args:
             initial_obs:  First observation of the episode (contains goal).
@@ -367,12 +360,6 @@ class HierarchicalAgent(BaseAgent):
         ]
         return self.chat(messages, max_tokens=200)
 
-    def add_reflection(self, reflection: str):
-        """Add a reflection, keeping at most max_trials entries."""
-        self.reflections.append(reflection)
-        if len(self.reflections) > self.max_trials:
-            self.reflections = self.reflections[-self.max_trials:]
-
     # ── Helpers ─────────────────────────────────────────────────────────────────
 
     def _current_subgoal(self) -> str:
@@ -380,3 +367,7 @@ class HierarchicalAgent(BaseAgent):
             return "complete the task"
         idx = min(self._subgoal_idx, len(self._subgoals) - 1)
         return self._subgoals[idx]
+
+
+# Backward-compatibility alias
+HierarchicalReflexionAgent = HierarchicalAgent

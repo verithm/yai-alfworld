@@ -10,7 +10,7 @@ class BaseAgent(ABC):
         self.model_name = model_name
         self.ollama_url = ollama_url.rstrip("/")
 
-    def chat(self, messages: List[dict], max_tokens: int = 128) -> str:
+    def chat(self, messages: List[dict], max_tokens: int = 32) -> str:
         """Send messages to Ollama and return the response text.
 
         Inference hyperparameters (shared across ALL agents for experimental consistency):

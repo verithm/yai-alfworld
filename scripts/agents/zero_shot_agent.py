@@ -1,16 +1,20 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from .base_agent import BaseAgent
 
-SYSTEM_PROMPT = (
-    "You are an agent playing a text-based household task game.\n"
-    "Your goal is to complete the assigned task by issuing actions.\n"
-    "You will be given your current observation and a list of valid actions.\n"
-    "Reply with EXACTLY ONE action from the list — nothing else."
+SFT_SYSTEM_PROMPT = (
+    "You are a household robot completing tasks in a text-based environment.\n"
+    "At each step you are given the current observation and a list of admissible actions.\n"
+    "Reply with ONLY the exact action string from the admissible list. Do not explain."
 )
+SYSTEM_PROMPT = SFT_SYSTEM_PROMPT
 
 
 class ZeroShotAgent(BaseAgent):
     """Zero-shot agent: no examples, just instruction + current state."""
+
+    def _get_system_prompt(self) -> str:
+        """Return the system prompt. Overridable by subclasses to inject examples."""
+        return SYSTEM_PROMPT
 
     def act(
         self,
@@ -18,27 +22,22 @@ class ZeroShotAgent(BaseAgent):
         admissible_commands: List[str],
         history: List[Tuple[str, str]],
     ) -> str:
-        # Include up to 5 recent (action, observation) pairs for context
-        context_lines = []
-        for action, obs in history[-5:]:
-            context_lines.append(f"Action: {action}\nObservation: {obs}")
-        context = "\n\n".join(context_lines)
+        def _user_turn(obs: str, commands: Optional[List[str]] = None) -> str:
+            content = f"Observation: {obs}"
+            if commands:
+                cmds = "\n".join(f"  - {c}" for c in commands)
+                content += f"\n\nAdmissible actions:\n{cmds}"
+            return content
 
-        commands_str = "\n".join(f"  - {cmd}" for cmd in admissible_commands)
-
-        user_content = ""
-        if context:
-            user_content += f"Recent history:\n{context}\n\n"
-        user_content += (
-            f"Current observation:\n{observation}\n\n"
-            f"Valid actions:\n{commands_str}\n\n"
-            "Choose ONE action from the list above and reply with it exactly."
-        )
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+        messages: List[dict] = [
+            {"role": "system", "content": self._get_system_prompt()}
         ]
+        # Prior turns as proper multi-turn conversation (last 5 pairs)
+        for action, obs in history[-5:]:
+            messages.append({"role": "user",      "content": _user_turn(obs)})
+            messages.append({"role": "assistant",  "content": action})
+        # Current turn
+        messages.append({"role": "user", "content": _user_turn(observation, admissible_commands)})
 
-        response = self.chat(messages)
+        response = self.chat(messages, max_tokens=32)
         return self.match_command(response, admissible_commands)

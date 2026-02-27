@@ -1,38 +1,39 @@
 """
 Few-shot agent — ALFWorld implementation.
 
-Provides one action-only demonstration per ALFWorld task type (6 total).
-Unlike ReAct, there are no explicit Thoughts — only Observation/Action pairs.
-The correct example is selected based on the detected task type.
+Extends ZeroShotAgent by overriding _get_system_prompt() to append a
+task-type-specific action-only demonstration.  All act() logic (5-turn
+history window, user content format, chat call) is inherited unchanged.
 
-Examples are sourced from examples.py, which also drives ReActAgent.
-Both agents solve identical tasks with identical action sequences; the only
-difference is that ReActAgent includes explicit Thought lines while this
-agent shows pure Observation → Action pairs.
+Unlike ReAct, examples show pure Action/Observation pairs with no Thought
+lines.  Examples are sourced from ACT_EXAMPLES in examples.py; ReActAgent
+uses the same trajectories with Thought lines added (REACT_EXAMPLES),
+ensuring experimental consistency between the two agents.
+
+SFT compatibility: the example block is appended to the SFT system prompt,
+not injected into user/assistant turns.  The user message format
+(Observation: / Admissible actions:) — the PRIMARY SFT conditioning signal —
+is unchanged.
 """
 
 from typing import List, Optional, Tuple
 
-from .base_agent import BaseAgent
-from .react_agent import _detect_task_type
+from .zero_shot_agent import ZeroShotAgent
 from .examples import ACT_EXAMPLES
-
-_SYSTEM_PREFIX = """\
-You are an agent solving text-based household tasks.
-Study the example below, then choose the best action for the current situation.
-Reply with EXACTLY ONE action from the valid actions list — nothing else.
-
---- EXAMPLE ---
-{example}
---- END EXAMPLE ---"""
+from .task_utils import _detect_task_type
 
 
-class FewShotAgent(BaseAgent):
+class FewShotAgent(ZeroShotAgent):
     """
-    Few-shot agent: prepends one task-type-specific demonstration per game.
-    No explicit reasoning steps (unlike ReAct) — action-only examples.
-    The example is drawn from the same canonical trajectories as ReActAgent
-    (examples.py), ensuring experimental consistency between the two agents.
+    Few-shot agent: task-type-specific action-only demonstrations.
+
+    Extends ZeroShotAgent:
+      - _get_system_prompt() appends a task-specific ACT_EXAMPLES block to
+        the SFT system message, giving the model one successful trajectory
+        as context before it acts.
+      - act() detects task type on the first step; _get_system_prompt() uses
+        the cached _task_type to inject the correct example.
+      - All other logic (5-turn history, user content, match_command) inherited.
     """
 
     def __init__(self, model_name: str, ollama_url: str):
@@ -40,7 +41,18 @@ class FewShotAgent(BaseAgent):
         self._task_type: Optional[str] = None
 
     def reset(self):
+        super().reset()
         self._task_type = None
+
+    def _get_system_prompt(self) -> str:
+        base = super()._get_system_prompt()  # SFT_SYSTEM_PROMPT
+        if self._task_type and self._task_type in ACT_EXAMPLES:
+            return (
+                base
+                + "\n\nHere is an example of a successful trajectory:\n\n"
+                + ACT_EXAMPLES[self._task_type]
+            )
+        return base
 
     def act(
         self,
@@ -48,32 +60,8 @@ class FewShotAgent(BaseAgent):
         admissible_commands: List[str],
         history: List[Tuple[str, str]],
     ) -> str:
+        # Detect task type on first step so _get_system_prompt() can inject
+        # the matching example for all subsequent calls this episode.
         if not self._task_type:
             self._task_type = _detect_task_type(observation)
-
-        example = ACT_EXAMPLES.get(self._task_type, ACT_EXAMPLES["pick_and_place"])
-        system_prompt = _SYSTEM_PREFIX.format(example=example)
-
-        context_lines = []
-        for action, obs in history[-5:]:
-            context_lines.append(f"Action: {action}\nObservation: {obs}")
-        context = "\n\n".join(context_lines)
-
-        commands_str = "\n".join(f"  - {cmd}" for cmd in admissible_commands)
-
-        user_content = ""
-        if context:
-            user_content += f"Recent history:\n{context}\n\n"
-        user_content += (
-            f"Current observation:\n{observation}\n\n"
-            f"Valid actions:\n{commands_str}\n\n"
-            "Choose ONE action from the list above and reply with it exactly."
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_content},
-        ]
-
-        response = self.chat(messages)
-        return self.match_command(response, admissible_commands)
+        return super().act(observation, admissible_commands, history)

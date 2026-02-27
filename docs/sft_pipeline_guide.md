@@ -17,7 +17,7 @@ The versions below are known-good as of early 2026 for Llama-3.1-8B QLoRA traini
 | PyTorch        | **2.4.1**            | Official cu121 wheels; all LoRA ops work       |
 | transformers   | **4.45.0**           | Llama-3.1 tokenizer fixes included             |
 | peft           | **0.11.0**           | Required for Unsloth integration               |
-| trl            | **0.10.0**           | `SFTConfig`/`SFTTrainer` API stable            |
+| trl            | **0.24.0**           | `SFTConfig`/`SFTTrainer` API stable            |
 | bitsandbytes   | **0.44.0**           | 4-bit QLoRA with CUDA 12.1                     |
 | accelerate     | **1.0.0**            | Single-GPU or multi-GPU training               |
 | datasets       | **2.20.0**           | JSONL loading and formatting                   |
@@ -120,7 +120,7 @@ pip install \
 pip install \
   transformers==4.45.0 \
   peft==0.11.0 \
-  trl==0.10.0 \
+  trl==0.24.0 \
   bitsandbytes==0.44.0 \
   accelerate==1.0.0 \
   datasets==2.20.0
@@ -154,14 +154,26 @@ Save as `scripts/sft_train.py`:
 
 ```python
 """
-QLoRA fine-tuning of Llama-3.1-8B on ALFWorld oracle trajectories.
+QLoRA fine-tuning of Llama-3.1-8B-Instruct on ALFWorld oracle trajectories.
 
 Usage:
   python scripts/sft_train.py \
     --data   results/oracle/trajectories.jsonl \
     --output results/sft_adapter \
-    --epochs 3
+    --epochs 3 \
+    --batch  1 \
+    --grad-accum 16
 """
+
+# ── Unsloth MUST be imported first to apply its patches ──────────────────────
+try:
+    from unsloth import FastLanguageModel
+    USE_UNSLOTH = True
+except ImportError:
+    from transformers import AutoModelForCausalLM
+    USE_UNSLOTH = False
+    print("Unsloth not available — falling back to pure PEFT+TRL")
+
 import argparse
 import json
 from pathlib import Path
@@ -172,25 +184,18 @@ from transformers import AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
-try:
-    from unsloth import FastLanguageModel
-    USE_UNSLOTH = True
-except ImportError:
-    from transformers import AutoModelForCausalLM
-    USE_UNSLOTH = False
-    print("Unsloth not available — falling back to pure PEFT+TRL")
-
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data",   default="results/oracle/trajectories.jsonl")
 parser.add_argument("--output", default="results/sft_adapter")
-parser.add_argument("--base",   default="meta-llama/Llama-3.1-8B")
-parser.add_argument("--epochs", type=int, default=3)
-parser.add_argument("--batch",  type=int, default=4)
-parser.add_argument("--lr",     type=float, default=2e-4)
-parser.add_argument("--max-seq-len", type=int, default=8192)
+parser.add_argument("--base",       default="unsloth/Meta-Llama-3.1-8B-Instruct")
+parser.add_argument("--epochs",     type=int,   default=3)
+parser.add_argument("--batch",      type=int,   default=1)
+parser.add_argument("--grad-accum", type=int,   default=16)
+parser.add_argument("--lr",         type=float, default=2e-4)
+parser.add_argument("--max-seq-len", type=int,  default=8192)
 args = parser.parse_args()
 
 
@@ -219,10 +224,12 @@ print(f"Loaded {len(raw)} training records from {args.data}")
 if USE_UNSLOTH:
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base,
-        max_seq_length=args.max_seq_len,
-        dtype=None,           # auto-detect (bfloat16 on Ampere+)
+        max_seq_length=args.max_seq_len,   # Unsloth API still uses max_seq_length
+        dtype=None,                         # auto-detect (bfloat16 on Ampere+)
         load_in_4bit=True,
     )
+    # Instruct tokenizer already has eos/pad configured; set pad = eos to be explicit
+    tokenizer.pad_token = tokenizer.eos_token
     model = FastLanguageModel.get_peft_model(
         model,
         r=16,
@@ -281,7 +288,7 @@ training_args = SFTConfig(
     num_train_epochs=args.epochs,
     per_device_train_batch_size=args.batch,
     per_device_eval_batch_size=args.batch,
-    gradient_accumulation_steps=4,
+    gradient_accumulation_steps=args.grad_accum,
     learning_rate=args.lr,
     lr_scheduler_type="cosine",
     warmup_ratio=0.05,
@@ -293,7 +300,7 @@ training_args = SFTConfig(
     save_steps=200,
     save_total_limit=2,
     load_best_model_at_end=True,
-    max_seq_length=args.max_seq_len,
+    max_length=args.max_seq_len,        # trl 0.24.0: was max_seq_length in older versions
     dataset_text_field="text",
     packing=False,
     report_to="none",
@@ -301,7 +308,7 @@ training_args = SFTConfig(
 
 trainer = SFTTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,         # trl 0.24.0: was 'tokenizer' in older versions
     train_dataset=dataset["train"],
     eval_dataset=dataset["test"],
     args=training_args,
@@ -321,14 +328,16 @@ print(f"\nAdapter saved to: {output_dir}")
 source ~/sft_env/bin/activate
 
 python scripts/sft_train.py \
-  --data   results/oracle/trajectories.jsonl \
-  --output results/sft_adapter \
-  --base   meta-llama/Llama-3.1-8B \
-  --epochs 3 \
-  --batch  4
+  --data       results/oracle/trajectories.jsonl \
+  --output     results/sft_adapter \
+  --base       unsloth/Meta-Llama-3.1-8B-Instruct \
+  --epochs     3 \
+  --batch      1 \
+  --grad-accum 16
 ```
 
-**Expected training time** on a single A100 (80 GB): ~2–4 hours for 3 epochs over ~2 000 records.
+**Expected training time** on a single A100 (80 GB): ~2–4 hours for 3 epochs over ~2 500 records.
+`batch=1 × grad_accum=16` → effective batch size = 16.
 
 ### B4 — Register the Adapter with Ollama
 

@@ -150,177 +150,14 @@ print(f'GPU name:       {torch.cuda.get_device_name(0) if torch.cuda.is_availabl
 
 ### B2 — Training Script
 
-Save as `scripts/sft_train.py`:
+The training script is at `scripts/sft_train.py` in the repository.
+Key implementation notes (for reference):
 
-```python
-"""
-QLoRA fine-tuning of Llama-3.1-8B-Instruct on ALFWorld oracle trajectories.
-
-Usage:
-  python scripts/sft_train.py \
-    --data   results/oracle/trajectories.jsonl \
-    --output results/sft_adapter \
-    --epochs 3 \
-    --batch  1 \
-    --grad-accum 16
-"""
-
-# ── Unsloth MUST be imported first to apply its patches ──────────────────────
-try:
-    from unsloth import FastLanguageModel
-    USE_UNSLOTH = True
-except ImportError:
-    from transformers import AutoModelForCausalLM
-    USE_UNSLOTH = False
-    print("Unsloth not available — falling back to pure PEFT+TRL")
-
-import argparse
-import json
-from pathlib import Path
-
-import torch
-from datasets import Dataset
-from transformers import AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig
-
-
-# ── CLI ─────────────────────────────────────────────────────────────────────
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--data",   default="results/oracle/trajectories.jsonl")
-parser.add_argument("--output", default="results/sft_adapter")
-parser.add_argument("--base",       default="unsloth/Meta-Llama-3.1-8B-Instruct")
-parser.add_argument("--epochs",     type=int,   default=3)
-parser.add_argument("--batch",      type=int,   default=1)
-parser.add_argument("--grad-accum", type=int,   default=16)
-parser.add_argument("--lr",         type=float, default=2e-4)
-parser.add_argument("--max-seq-len", type=int,  default=8192)
-args = parser.parse_args()
-
-
-# ── Load & format data ───────────────────────────────────────────────────────
-
-def load_jsonl(path: str):
-    with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-def format_record(record: dict, tokenizer) -> str:
-    """Convert a chat record to the model's chat template format.
-
-    Data schema: {"messages": [{"role": "system", ...}, ...], "gamefile": ..., "steps": N}
-    The system prompt is already embedded as messages[0].
-    """
-    return tokenizer.apply_chat_template(
-        record["messages"], tokenize=False, add_generation_prompt=False
-    )
-
-raw = load_jsonl(args.data)
-print(f"Loaded {len(raw)} training records from {args.data}")
-
-
-# ── Load model ───────────────────────────────────────────────────────────────
-
-if USE_UNSLOTH:
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.base,
-        max_seq_length=args.max_seq_len,   # Unsloth API still uses max_seq_length
-        dtype=None,                         # auto-detect (bfloat16 on Ampere+)
-        load_in_4bit=True,
-    )
-    # Instruct tokenizer already has eos/pad configured; set pad = eos to be explicit
-    tokenizer.pad_token = tokenizer.eos_token
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                         "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=32,
-        lora_dropout=0.0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-    )
-else:
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.base)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base,
-        quantization_config=bnb_config,
-        device_map="auto",
-    )
-    model = prepare_model_for_kbit_training(model)
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-    )
-    model = get_peft_model(model, lora_config)
-
-model.print_trainable_parameters()
-
-
-# ── Prepare dataset ──────────────────────────────────────────────────────────
-
-formatted = [format_record(r, tokenizer) for r in raw]
-dataset = Dataset.from_dict({"text": formatted})
-dataset = dataset.train_test_split(test_size=0.05, seed=42)
-print(f"Train: {len(dataset['train'])}  Eval: {len(dataset['test'])}")
-
-
-# ── Training ─────────────────────────────────────────────────────────────────
-
-output_dir = Path(args.output)
-output_dir.mkdir(parents=True, exist_ok=True)
-
-training_args = SFTConfig(
-    output_dir=str(output_dir),
-    num_train_epochs=args.epochs,
-    per_device_train_batch_size=args.batch,
-    per_device_eval_batch_size=args.batch,
-    gradient_accumulation_steps=args.grad_accum,
-    learning_rate=args.lr,
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.05,
-    bf16=True,
-    logging_steps=10,
-    eval_strategy="steps",
-    eval_steps=100,
-    save_strategy="steps",
-    save_steps=200,
-    save_total_limit=2,
-    load_best_model_at_end=True,
-    max_length=args.max_seq_len,        # trl 0.24.0: was max_seq_length in older versions
-    dataset_text_field="text",
-    packing=False,
-    report_to="none",
-)
-
-trainer = SFTTrainer(
-    model=model,
-    processing_class=tokenizer,         # trl 0.24.0: was 'tokenizer' in older versions
-    train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
-    args=training_args,
-)
-
-trainer.train()
-
-# Save adapter
-model.save_pretrained(str(output_dir))
-tokenizer.save_pretrained(str(output_dir))
-print(f"\nAdapter saved to: {output_dir}")
-```
+- Unsloth must be imported before trl/transformers/peft to apply its patches.
+- `SFTConfig` uses `max_length` (not `max_seq_length`) in trl 0.24.0.
+- `SFTTrainer` uses `processing_class=tokenizer` (not `tokenizer=`) in trl 0.24.0.
+- Unsloth's `FastLanguageModel.from_pretrained` still uses `max_seq_length` (its own parameter).
+- `batch=1, grad_accum=16` → effective batch size = 16 (A100 80 GB OOMs at batch > 1 with seq_len = 8192).
 
 ### B3 — Run Training
 
@@ -349,12 +186,12 @@ python3 - <<'EOF'
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-base  = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B", torch_dtype="auto")
+base  = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", torch_dtype="auto")
 model = PeftModel.from_pretrained(base, "results/sft_adapter")
 merged = model.merge_and_unload()
 
 merged.save_pretrained("results/sft_merged")
-AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B").save_pretrained("results/sft_merged")
+AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct").save_pretrained("results/sft_merged")
 print("Merged model saved to results/sft_merged/")
 EOF
 
@@ -364,11 +201,18 @@ git clone --depth 1 https://github.com/ggerganov/llama.cpp.git /tmp/llama.cpp
 pip install -r /tmp/llama.cpp/requirements.txt
 
 python3 /tmp/llama.cpp/convert_hf_to_gguf.py results/sft_merged/ \
-  --outfile results/llama3.1-8b-sft.gguf --outtype q4_k_m
+  --outfile results/llama3.1-8b-sft.gguf --outtype q8_0
 ollama create llama3.1:8b-sft -f - <<'MODELFILE'
 FROM ./results/llama3.1-8b-sft.gguf
 MODELFILE
 ```
+
+> **Note — quantization**: `--outtype q4_k_m` is no longer supported in recent llama.cpp builds.
+> We use `q8_0` (8-bit quantization) for both the SFT model and the control baseline.
+>
+> **Baseline model registration**: The unmodified `meta-llama/Llama-3.1-8B-Instruct` weights
+> were converted and quantized with the same `q8_0` method and registered in Ollama as
+> `llama3.1:8b-base`. Use this model name when running Phase 1 / control evaluations.
 
 ### B5 — Run Phase 3 Evaluation with SFT Model
 
@@ -423,7 +267,7 @@ pip install --upgrade peft
 
 Llama-3.1-8B requires accepting Meta's license:
 
-1. Visit https://huggingface.co/meta-llama/Llama-3.1-8B and accept the license.
+1. Visit https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct and accept the license.
 2. Authenticate: `huggingface-cli login`
 3. Re-run the training script.
 
